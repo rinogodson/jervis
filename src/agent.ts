@@ -2,7 +2,7 @@ import { TypeSafeClient, choice, noul } from "@typesafe-ai/sdk";
 import { BrowserController } from "./browser";
 import { HelperLLM } from "./llm";
 import { buildPerception } from "./perception";
-import type { Action, DistilledAction, Perception, StepRecord } from "./types";
+import type { Action, DistilledAction, Perception, StepRecord, AgentResult } from "./types";
 
 export interface AgentConfig {
   goal: string;
@@ -50,16 +50,20 @@ export class JevAgent {
     this.plannerModel = process.env.JERVIS_PLANNER_MODEL || "typesafe/jev-1.13";
   }
 
-  async run(config: AgentConfig): Promise<boolean> {
+  async run(config: AgentConfig): Promise<AgentResult> {
     const maxSteps = config.maxSteps ?? 40;
     const maxDurationMs = config.maxDurationMs ?? 300000;
 
     console.log(`\ngoal: "${config.goal}"`);
     console.log(`launching browser to: ${config.startUrl}`);
 
-    await this.browser.launch(config.headless ?? true);
+    let browserLaunched = false;
 
     try {
+
+      await this.browser.launch(config.headless ?? true);
+      browserLaunched = true;
+      
       await this.browser.goto(config.startUrl);
 
       const start = Date.now();
@@ -71,14 +75,17 @@ export class JevAgent {
       for (let step = 1; step <= maxSteps; step++) {
         if (Date.now() - start > maxDurationMs) {
           console.log(`\nreached max duration (${maxDurationMs}ms).`);
-          return false;
+          return {
+            status: "timeout",
+            reason: "max duration exceeded"
+          };
         }
 
         console.log(`\n--- step ${step} / ${maxSteps} ---`);
         await this.browser.waitForStable(300, 4000).catch(() => {});
 
         const page = this.browser.activePage();
-        if (!page) return false;
+        if (!page) return { status: "failed", reason: "no active page" };
         const perception = await buildPerception(page, {
           actionLimit: 60,
           textBudget: 3000,
@@ -120,18 +127,21 @@ export class JevAgent {
             .extractAnswer(config.goal, perception.text)
             .catch(() => "");
           console.log(`\nfinal answer: ${answer}\n`);
-          return true;
+          return{
+            status: "success",
+            answer
+          };
         }
 
         if (chosenId === "act_fail") {
           console.log(`\nstopped: jev determined the task is blocked.`);
-          return false;
+          return { status: "failed", reason: "task is blocked" };
         }
 
         const actionKey = `${perception.url}#${chosenId}`;
         if (this.isStalled(history, actionKey)) {
           console.log(`\nstalled: repeated no-op action [${chosenId}].`);
-          return false;
+          return { status: "failed", reason: "task is blocked" };
         }
 
         const outcome = await this.execute(config, perception, chosenId);
@@ -146,10 +156,15 @@ export class JevAgent {
       }
 
       console.log(`\nreached maximum steps without conclusion.`);
-      return false;
+      return {
+        status: "failed",
+        reason: "max steps reached without conclusion"
+      };
     } finally {
-      console.log("shutting down browser...");
-      await this.browser.close();
+      if (browserLaunched) {
+        console.log("shutting down browser...");
+        await this.browser.close();
+      }
     }
   }
 
